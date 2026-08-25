@@ -35,11 +35,12 @@ from agent.promise_tracker import record_promise
 import requests
 
 API_KEY_NAME = "X-API-Key"
-API_KEY = os.getenv("DASHBOARD_API_KEY", "supersecretkey")
+API_KEY = os.getenv("DASHBOARD_API_KEY", "")
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 def verify_api_key(api_key_header: str = Security(api_key_header)):
-    if api_key_header != API_KEY:
+    # If DASHBOARD_API_KEY is configured in env, strictly validate it
+    if API_KEY and api_key_header != API_KEY:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Could not validate credentials"
         )

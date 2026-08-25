@@ -22,39 +22,40 @@ from agent.execute import execute
 from agent.promise_tracker import check_promises
 
 
-async def process_event(pe_id: str, summary: dict):
-    db = SessionLocal()
-    try:
-        pe = db.query(PaymentEvent).filter(PaymentEvent.id == pe_id).first()
-        if not pe:
-            return
-            
-        diag = await diagnose(pe, db)
-        summary["diagnosed"] += 1
+async def process_event(pe_id: str, summary: dict, sem: asyncio.Semaphore):
+    async with sem:
+        db = SessionLocal()
+        try:
+            pe = db.query(PaymentEvent).filter(PaymentEvent.id == pe_id).first()
+            if not pe:
+                return
+                
+            diag = await diagnose(pe, db)
+            summary["diagnosed"] += 1
 
-        # Immediately decide an action for the new diagnosis
-        action = decide(diag, db)
-        summary["decisions_made"] += 1
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        summary["errors"].append(f"Diagnosis error for {pe_id[:8]}: {str(e)}")
-        db.add(AuditLog(
-            actor="system",
-            action="pipeline_error",
-            reasoning=f"Error diagnosing payment event {pe_id[:8]}: {str(e)}",
-            related_entity_type="PaymentEvent",
-            related_entity_id=pe_id,
-        ))
-        db.commit()
-    finally:
-        db.close()
+            # Immediately decide an action for the new diagnosis
+            action = decide(diag, db)
+            summary["decisions_made"] += 1
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            summary["errors"].append(f"Diagnosis error for {pe_id[:8]}: {str(e)}")
+            db.add(AuditLog(
+                actor="system",
+                action="pipeline_error",
+                reasoning=f"Error diagnosing payment event {pe_id[:8]}: {str(e)}",
+                related_entity_type="PaymentEvent",
+                related_entity_id=pe_id,
+            ))
+            db.commit()
+        finally:
+            db.close()
 
 
 async def run_batch() -> dict:
     """
     Run the full agent pipeline asynchronously:
-      1. Diagnose unprocessed payment events concurrently
+      1. Diagnose unprocessed payment events concurrently (bounded by semaphore)
       2. Execute due recovery actions
       3. Check promise statuses
     """
@@ -76,8 +77,9 @@ async def run_batch() -> dict:
             .all()
         )
 
-        # Batch LLM diagnoses concurrently
-        tasks = [process_event(pe.id, summary) for pe in undiagnosed]
+        # Batch LLM diagnoses concurrently with semaphore
+        sem = asyncio.Semaphore(5)
+        tasks = [process_event(pe.id, summary, sem) for pe in undiagnosed]
         await asyncio.gather(*tasks)
 
         # ── Step 2: Execute due recovery actions ──────────

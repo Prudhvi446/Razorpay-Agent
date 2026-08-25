@@ -9,36 +9,44 @@ from config import DATABASE_URL
 
 
 def normalize_database_url(url: str | None) -> str:
-    """Safely URL-encode password if it contains special characters like @ or #."""
     if not url:
         return "sqlite:///./recovery_agent.db"
-
-    # Handle postgres:// vs postgresql://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
-
-    # Check if there are multiple '@' characters in credentials
-    # e.g., postgresql://user:pass@word@host:5432/db
-    if "://" in url and "@" in url:
-        prefix, rest = url.split("://", 1)
-        # Split on the last '@' to separate user:pass from host:port/db
-        creds_part, host_part = rest.rsplit("@", 1)
-        if ":" in creds_part:
-            user, password = creds_part.split(":", 1)
-            # URL-encode password if not already percent-encoded
-            encoded_password = quote_plus(password)
-            return f"{prefix}://{user}:{encoded_password}@{host_part}"
-
     return url
 
 
-engine = create_engine(
-    normalize_database_url(DATABASE_URL), 
-    pool_pre_ping=True, 
-    pool_size=10, 
-    max_overflow=20, 
-    echo=False
-)
+from sqlalchemy.pool import NullPool
+
+def init_engine():
+    db_url = normalize_database_url(DATABASE_URL)
+    if not db_url or db_url.startswith("sqlite"):
+        return create_engine(
+            "sqlite:///./recovery_agent.db",
+            connect_args={"check_same_thread": False, "timeout": 30},
+            pool_pre_ping=True,
+            echo=False,
+        )
+
+    if "pooler.supabase.com" in db_url or ":6543" in db_url:
+        return create_engine(
+            db_url,
+            poolclass=NullPool,
+            connect_args={"sslmode": "require", "connect_timeout": 5},
+            echo=False,
+        )
+
+    return create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        pool_size=5,
+        max_overflow=10,
+        connect_args={"connect_timeout": 5},
+        echo=False,
+    )
+
+engine = init_engine()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
