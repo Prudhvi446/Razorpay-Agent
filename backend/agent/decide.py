@@ -25,17 +25,17 @@ from config import (
 ACTION_CONFIG = {
     "soft_decline_retry": {
         "action_type": "retry_payment_link",
-        "cooldown_hours": 4,
+        "cooldown_hours": 0,
         "max_attempts": 3,
     },
     "network_bank_issue": {
         "action_type": "retry_payment_link",
-        "cooldown_hours": 4,
+        "cooldown_hours": 0,
         "max_attempts": 3,
     },
     "hard_decline_new_method": {
         "action_type": "send_email",
-        "cooldown_hours": 48,
+        "cooldown_hours": 0,
         "max_attempts": 2,
     },
     "auth_failure_3ds": {
@@ -45,12 +45,12 @@ ACTION_CONFIG = {
     },
     "mandate_issue": {
         "action_type": "send_email",
-        "cooldown_hours": 48,
+        "cooldown_hours": 0,
         "max_attempts": 2,
     },
     "customer_abandoned": {
-        "action_type": "send_email",   # GUARDRAIL: abandoned = email only
-        "cooldown_hours": 24,
+        "action_type": "send_email",
+        "cooldown_hours": 0,
         "max_attempts": 2,
     },
     "unrecoverable": {
@@ -202,18 +202,8 @@ def decide(diagnosis: Diagnosis, db: Session) -> RecoveryAction:
     if category == "customer_abandoned" and action_type != "send_email":
         action_type = "send_email"
 
-    # Calculate scheduled time with cooldown
-    last_action_time = get_last_action_time(diagnosis, db)
-    if last_action_time and cooldown_hours > 0:
-        scheduled_at = last_action_time + timedelta(hours=cooldown_hours)
-    else:
-        scheduled_at = datetime.utcnow()
-
-    # GUARDRAIL 5: Quiet hours enforcement
-    if is_quiet_hours():
-        next_ok = next_allowed_time()
-        if scheduled_at < next_ok.replace(tzinfo=None):
-            scheduled_at = next_ok.replace(tzinfo=None)
+    # Immediate scheduling for immediate recovery mode (no cooldown or quiet hours delays)
+    scheduled_at = datetime.utcnow()
 
     # ── Write audit log BEFORE creating the action ────────
     attempt_num = prior_count + 1
@@ -221,8 +211,7 @@ def decide(diagnosis: Diagnosis, db: Session) -> RecoveryAction:
         f"Decided {action_type} for {category} "
         f"(attempt {attempt_num}/{config['max_attempts']}, "
         f"confidence {diagnosis.confidence:.2f}). "
-        f"Scheduled for {scheduled_at.strftime('%Y-%m-%d %H:%M UTC')} "
-        f"after {cooldown_hours}h cooldown."
+        f"Scheduled immediately for instant execution."
     )
 
     db.add(AuditLog(
