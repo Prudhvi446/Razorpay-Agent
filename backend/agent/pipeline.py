@@ -11,10 +11,9 @@ Orchestrates:
 This is called by APScheduler every 5 minutes and by POST /api/run-batch.
 """
 
+import asyncio
 from datetime import datetime
-
 from sqlalchemy.orm import Session
-
 from database import SessionLocal
 from models import PaymentEvent, Diagnosis, RecoveryAction, AuditLog
 from agent.diagnose import diagnose
@@ -23,14 +22,41 @@ from agent.execute import execute
 from agent.promise_tracker import check_promises
 
 
-def run_batch() -> dict:
+async def process_event(pe_id: str, summary: dict):
+    db = SessionLocal()
+    try:
+        pe = db.query(PaymentEvent).filter(PaymentEvent.id == pe_id).first()
+        if not pe:
+            return
+            
+        diag = await diagnose(pe, db)
+        summary["diagnosed"] += 1
+
+        # Immediately decide an action for the new diagnosis
+        action = decide(diag, db)
+        summary["decisions_made"] += 1
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        summary["errors"].append(f"Diagnosis error for {pe_id[:8]}: {str(e)}")
+        db.add(AuditLog(
+            actor="system",
+            action="pipeline_error",
+            reasoning=f"Error diagnosing payment event {pe_id[:8]}: {str(e)}",
+            related_entity_type="PaymentEvent",
+            related_entity_id=pe_id,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+
+async def run_batch() -> dict:
     """
-    Run the full agent pipeline:
-      1. Diagnose unprocessed payment events
+    Run the full agent pipeline asynchronously:
+      1. Diagnose unprocessed payment events concurrently
       2. Execute due recovery actions
       3. Check promise statuses
-    
-    Returns a summary dict for the API/scheduler.
     """
     db = SessionLocal()
     summary = {
@@ -50,26 +76,9 @@ def run_batch() -> dict:
             .all()
         )
 
-        for pe in undiagnosed:
-            try:
-                diag = diagnose(pe, db)
-                summary["diagnosed"] += 1
-
-                # Immediately decide an action for the new diagnosis
-                action = decide(diag, db)
-                summary["decisions_made"] += 1
-
-            except Exception as e:
-                summary["errors"].append(f"Diagnosis error for {pe.id[:8]}: {str(e)}")
-                db.add(AuditLog(
-                    actor="system",
-                    action="pipeline_error",
-                    reasoning=f"Error diagnosing payment event {pe.id[:8]}: {str(e)}",
-                    related_entity_type="PaymentEvent",
-                    related_entity_id=pe.id,
-                ))
-
-        db.commit()
+        # Batch LLM diagnoses concurrently
+        tasks = [process_event(pe.id, summary) for pe in undiagnosed]
+        await asyncio.gather(*tasks)
 
         # ── Step 2: Execute due recovery actions ──────────
         due_actions = (

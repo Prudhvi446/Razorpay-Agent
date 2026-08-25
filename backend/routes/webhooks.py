@@ -120,9 +120,22 @@ async def razorpay_webhook(request: Request):
 
     payload = data.get("payload", {})
 
-    # Extract and persist
+    # Check Idempotency
+    event_id = request.headers.get("X-Razorpay-Event-Id") or request.headers.get("x-razorpay-event-id")
+    # If no header, fallback to hashing the payload for a unique signature-based ID
+    if not event_id:
+        event_id = hashlib.md5(body).hexdigest()
+
     db = SessionLocal()
     try:
+        from models import ProcessedWebhook
+        # Check if already processed
+        if db.query(ProcessedWebhook).filter(ProcessedWebhook.event_id == event_id).first():
+            return {"status": "idempotent_success", "message": "Already processed", "event": event_type}
+
+        # Mark as processed immediately
+        db.add(ProcessedWebhook(event_id=event_id, event_type=event_type))
+
         payment_data = extract_payment_data(event_type, payload)
 
         pe = PaymentEvent(

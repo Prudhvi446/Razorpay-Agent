@@ -32,7 +32,13 @@ def normalize_database_url(url: str | None) -> str:
     return url
 
 
-engine = create_engine(normalize_database_url(DATABASE_URL), pool_pre_ping=True, echo=False)
+engine = create_engine(
+    normalize_database_url(DATABASE_URL), 
+    pool_pre_ping=True, 
+    pool_size=10, 
+    max_overflow=20, 
+    echo=False
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

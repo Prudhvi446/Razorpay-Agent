@@ -105,8 +105,8 @@ Respond with this exact JSON structure:
 """
 
 
-def llm_classify(pe: PaymentEvent, deterministic_cat: str, retry_count: int) -> dict:
-    """Call Gemini for enriched diagnosis."""
+async def llm_classify(pe: PaymentEvent, deterministic_cat: str, retry_count: int) -> dict:
+    """Call Gemini for enriched diagnosis asynchronously."""
     try:
         model = genai.GenerativeModel(GEMINI_MODEL)
         prompt = DIAGNOSIS_PROMPT.format(
@@ -120,7 +120,7 @@ def llm_classify(pe: PaymentEvent, deterministic_cat: str, retry_count: int) -> 
             deterministic_category=deterministic_cat,
         )
 
-        response = model.generate_content(
+        response = await model.generate_content_async(
             prompt,
             generation_config=genai.GenerationConfig(
                 response_mime_type="application/json",
@@ -148,9 +148,9 @@ def llm_classify(pe: PaymentEvent, deterministic_cat: str, retry_count: int) -> 
 
 # ── Main Diagnosis Function ──────────────────────────────
 
-def diagnose(payment_event: PaymentEvent, db: Session) -> Diagnosis:
+async def diagnose(payment_event: PaymentEvent, db: Session) -> Diagnosis:
     """
-    Diagnose a payment event's root cause.
+    Diagnose a payment event's root cause asynchronously.
     
     Returns a persisted Diagnosis object.
     """
@@ -159,7 +159,7 @@ def diagnose(payment_event: PaymentEvent, db: Session) -> Diagnosis:
     retry_count = get_retry_count(payment_event, db)
 
     # Step 2: LLM enrichment
-    llm_result = llm_classify(payment_event, det_category, retry_count)
+    llm_result = await llm_classify(payment_event, det_category, retry_count)
 
     # Step 3: Resolve disagreements
     # Trust LLM only if it disagrees AND has high confidence
@@ -197,3 +197,4 @@ def diagnose(payment_event: PaymentEvent, db: Session) -> Diagnosis:
 
     db.flush()  # Ensure IDs are assigned
     return diag
+

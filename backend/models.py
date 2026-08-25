@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    Column, String, Integer, Float, Text, DateTime, JSON,
+    Column, String, Integer, Float, Text, DateTime, JSON, Boolean,
     ForeignKey, Enum as SAEnum,
 )
 from sqlalchemy.orm import relationship
@@ -107,6 +107,8 @@ class RecoveryAction(Base):
     scheduled_at         = Column(DateTime, nullable=True)
     executed_at          = Column(DateTime, nullable=True)
     outcome              = Column(Text, nullable=True)
+    template_used        = Column(String, nullable=True)  # For A/B testing
+    discount_applied     = Column(Boolean, default=False) # For Cart Saver Engine
     created_at           = Column(DateTime, default=datetime.utcnow)
 
     # Relationships
@@ -153,3 +155,25 @@ class AuditLog(Base):
 
     def __repr__(self):
         return f"<AuditLog {self.id[:8]} actor={self.actor} action={self.action}>"
+
+
+# ── ProcessedWebhook (Idempotency) ─────────────────────────
+
+class ProcessedWebhook(Base):
+    __tablename__ = "processed_webhooks"
+
+    event_id             = Column(String, primary_key=True)
+    event_type           = Column(String, nullable=False)
+    processed_at         = Column(DateTime, default=datetime.utcnow)
+
+
+# ── DeadLetterQueue (DLQ) ──────────────────────────────────
+
+class DeadLetterQueue(Base):
+    __tablename__ = "dead_letter_queue"
+
+    id                   = Column(String, primary_key=True, default=_uuid)
+    entity_type          = Column(String, nullable=False)  # e.g., RecoveryAction
+    entity_id            = Column(String, nullable=False)
+    error_reason         = Column(Text, nullable=False)
+    failed_at            = Column(DateTime, default=datetime.utcnow)

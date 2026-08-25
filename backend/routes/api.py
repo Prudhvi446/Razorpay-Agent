@@ -13,9 +13,14 @@ Endpoints:
 
 import json
 import os
+import csv
+import uuid
+from io import StringIO
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Security, HTTPException, status
+from fastapi.security import APIKeyHeader
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -23,12 +28,24 @@ from sqlalchemy import func
 from database import get_db
 from models import (
     PaymentEvent, Diagnosis, RecoveryAction,
-    PromiseToPay, AuditLog,
+    PromiseToPay, AuditLog, ProcessedWebhook
 )
 from agent.pipeline import run_batch
 from agent.promise_tracker import record_promise
+import requests
 
-router = APIRouter(prefix="/api")
+API_KEY_NAME = "X-API-Key"
+API_KEY = os.getenv("DASHBOARD_API_KEY", "supersecretkey")
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+def verify_api_key(api_key_header: str = Security(api_key_header)):
+    if api_key_header != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Could not validate credentials"
+        )
+    return api_key_header
+
+router = APIRouter(prefix="/api", dependencies=[Depends(verify_api_key)])
 
 
 # ── Pydantic Schemas ──────────────────────────────────────
@@ -169,9 +186,9 @@ def get_audit_log(limit: int = Query(default=50, le=200), db: Session = Depends(
 # ── POST /api/run-batch ──────────────────────────────────
 
 @router.post("/run-batch")
-def trigger_batch():
+async def trigger_batch():
     """Manually trigger the agent pipeline for live demo."""
-    result = run_batch()
+    result = await run_batch()
     return result
 
 
@@ -267,3 +284,93 @@ def create_promise(req: PromiseRequest, db: Session = Depends(get_db)):
         "promised_amount": promise.promised_amount,
         "promised_date": promise.promised_date.isoformat(),
     }
+
+
+# ── GET /api/export-csv ──────────────────────────────────
+
+@router.get("/export-csv")
+def export_csv(db: Session = Depends(get_db)):
+    """Export Payment Events and Recovery Actions to CSV."""
+    f = StringIO()
+    writer = csv.writer(f)
+    
+    # Write header
+    writer.writerow([
+        "PaymentEvent_ID", "Status", "Amount", "Error_Reason",
+        "Diagnosis_Category", "Recovery_Action", "Recovery_Status",
+        "Template_Used", "Discount_Applied"
+    ])
+    
+    events = (
+        db.query(PaymentEvent, Diagnosis, RecoveryAction)
+        .outerjoin(Diagnosis, Diagnosis.payment_event_id == PaymentEvent.id)
+        .outerjoin(RecoveryAction, RecoveryAction.diagnosis_id == Diagnosis.id)
+        .all()
+    )
+    
+    for pe, diag, action in events:
+        writer.writerow([
+            pe.id,
+            pe.status,
+            pe.amount,
+            pe.error_reason,
+            diag.root_cause_category if diag else "",
+            action.action_type if action else "",
+            action.status if action else "",
+            action.template_used if action else "",
+            action.discount_applied if action else False,
+        ])
+    
+    f.seek(0)
+    return StreamingResponse(f, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=recovery_export.csv"})
+
+
+# ── POST /api/simulate-payment ───────────────────────────
+
+class SimulatePaymentRequest(BaseModel):
+    payment_link_id: str
+
+@router.post("/simulate-payment")
+def simulate_payment(req: SimulatePaymentRequest, db: Session = Depends(get_db)):
+    """Simulate a successful payment for a payment link."""
+    # Find the action with this payment link
+    action = db.query(RecoveryAction).filter(RecoveryAction.payment_link_url.like(f"%{req.payment_link_id}%")).first()
+    if not action:
+        raise HTTPException(status_code=404, detail="Payment link not found in any RecoveryAction")
+
+    diag = db.query(Diagnosis).filter(Diagnosis.id == action.diagnosis_id).first()
+    pe = db.query(PaymentEvent).filter(PaymentEvent.id == diag.payment_event_id).first()
+
+    # Simulate webhook hitting our backend
+    webhook_payload = {
+        "event": "payment.captured",
+        "payload": {
+            "payment": {
+                "entity": {
+                    "id": f"pay_sim_{uuid.uuid4().hex[:10]}",
+                    "amount": pe.amount,
+                    "status": "captured",
+                    "email": pe.customer_email,
+                    "contact": pe.customer_contact,
+                    "notes": {
+                        "recovery_for": pe.razorpay_payment_id
+                    }
+                }
+            }
+        }
+    }
+    
+    import requests
+    try:
+        # Need to call our own webhook endpoint locally
+        requests.post(
+            "http://localhost:8000/webhooks/razorpay",
+            json=webhook_payload,
+            headers={"X-Razorpay-Event-Id": f"ev_sim_{uuid.uuid4().hex[:10]}"},
+            timeout=2
+        )
+    except Exception as e:
+        return {"status": "error", "message": f"Simulated webhook failed: {str(e)}"}
+    
+    return {"status": "success", "message": "Simulated payment.captured webhook sent successfully."}
+

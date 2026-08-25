@@ -105,23 +105,45 @@ def get_payment_event(action: RecoveryAction, db: Session) -> PaymentEvent:
 
 
 import uuid
+import random
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
-def create_payment_link(pe: PaymentEvent) -> dict:
+# ── Resiliency Decorators (Tenacity) ──────────────────────
+
+class ExternalAPIError(Exception):
+    pass
+
+@retry(
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(ExternalAPIError)
+)
+def create_payment_link(pe: PaymentEvent, discount_applied: bool = False) -> dict:
     """Create a Razorpay payment link in test mode."""
     expire_by = int(time.time()) + (7 * 24 * 3600)  # 7 days from now
 
+    amount = pe.amount
+    notes = {
+        "original_order_id": pe.order_id or "",
+        "recovery_for": pe.razorpay_payment_id or "",
+        "source": "revenue_recovery_agent",
+    }
+    description = f"Recovery payment for order {pe.order_id or 'N/A'}"
+
+    # Cart Saver Engine Logic
+    if discount_applied:
+        amount = int(amount * 0.95)  # 5% off
+        notes["cart_saver_discount"] = "5_percent"
+        description += " (Cart Saver 5% Discount Applied)"
+
     payload = {
-        "amount": pe.amount,
+        "amount": amount,
         "currency": pe.currency or "INR",
-        "description": f"Recovery payment for order {pe.order_id or 'N/A'}",
+        "description": description,
         "customer": {},
         "notify": {"sms": False, "email": False},  # We handle notifications ourselves
         "expire_by": expire_by,
-        "notes": {
-            "original_order_id": pe.order_id or "",
-            "recovery_for": pe.razorpay_payment_id or "",
-            "source": "revenue_recovery_agent",
-        },
+        "notes": notes,
     }
 
     # Add customer info if available
@@ -147,7 +169,11 @@ def create_payment_link(pe: PaymentEvent) -> dict:
             "notice": f"Simulated link ({str(e)})",
         }
 
-
+@retry(
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(ExternalAPIError)
+)
 def send_email_via_resend(to_email: str, subject: str, html_body: str) -> dict:
     """Send an email using Resend's HTTP API."""
     try:
@@ -168,10 +194,14 @@ def send_email_via_resend(to_email: str, subject: str, html_body: str) -> dict:
         data = resp.json()
         if resp.status_code in (200, 201):
             return {"status": "sent", "id": data.get("id", ""), "error": None}
+        elif resp.status_code >= 500:
+            raise ExternalAPIError(f"Resend 500 error: {data}")
         else:
             # If Resend fails (e.g. sandbox restriction on unverified recipient), log and simulate for testing
             mock_id = f"email_{uuid.uuid4().hex[:12]}"
             return {"status": "sent", "id": mock_id, "simulated": True, "notice": data.get("message", str(data))}
+    except requests.exceptions.RequestException as e:
+        raise ExternalAPIError(f"Network error: {str(e)}")
     except Exception as e:
         mock_id = f"email_{uuid.uuid4().hex[:12]}"
         return {"status": "sent", "id": mock_id, "simulated": True, "notice": str(e)}
@@ -187,6 +217,8 @@ def execute(recovery_action: RecoveryAction, db: Session):
     category = diag.root_cause_category if diag else "unknown"
 
     amount_display = f"₹{pe.amount / 100:,.2f}" if pe else "₹0"
+    if pe and recovery_action.discount_applied:
+        amount_display += " (including 5% Cart Saver discount!)"
 
     try:
         if recovery_action.action_type in ("retry_payment_link", "retry_subscription"):
@@ -194,7 +226,7 @@ def execute(recovery_action: RecoveryAction, db: Session):
             if not pe:
                 raise ValueError("No PaymentEvent found for this action")
 
-            link_result = create_payment_link(pe)
+            link_result = create_payment_link(pe, discount_applied=recovery_action.discount_applied)
             recovery_action.payment_link_url = link_result.get("short_url", "")
 
             if link_result["status"] == "created":
@@ -231,21 +263,32 @@ def execute(recovery_action: RecoveryAction, db: Session):
                 return
 
             # First create a payment link to include in the email
-            link_result = create_payment_link(pe)
+            link_result = create_payment_link(pe, discount_applied=recovery_action.discount_applied)
             payment_link_url = link_result.get("short_url", "https://rzp.io/placeholder")
             recovery_action.payment_link_url = payment_link_url
 
-            # Get email template
-            template = EMAIL_TEMPLATES.get(category, EMAIL_TEMPLATES["soft_decline_retry"])
-            subject = template["subject"].format(amount=amount_display)
-            body = template["body"].format(amount=amount_display, payment_link=payment_link_url)
+            # ── A/B Testing: Template Selection ──────────
+            templates = ["standard", "urgent"]
+            selected_template = random.choice(templates)
+            recovery_action.template_used = selected_template
+
+            template_conf = EMAIL_TEMPLATES.get(category, EMAIL_TEMPLATES["soft_decline_retry"])
+            
+            subject = template_conf["subject"].format(amount=amount_display)
+            if selected_template == "urgent":
+                subject = f"Action Required: {subject}"
+
+            body = template_conf["body"].format(amount=amount_display, payment_link=payment_link_url)
+            if selected_template == "urgent":
+                body = body.replace("<h2", '<h2 style="color: #ef4444;"')
 
             email_result = send_email_via_resend(pe.customer_email, subject, body)
 
             if email_result["status"] == "sent":
                 recovery_action.status = "executed"
                 recovery_action.outcome = (
-                    f"Email sent to {pe.customer_email} (resend_id: {email_result['id']}). "
+                    f"Email sent to {pe.customer_email} (resend_id: {email_result['id']}, "
+                    f"template: {selected_template}). "
                     f"Payment link: {payment_link_url}"
                 )
                 audit_action = "email_sent"
@@ -270,6 +313,14 @@ def execute(recovery_action: RecoveryAction, db: Session):
         recovery_action.status = "failed"
         recovery_action.outcome = f"Execution error: {str(e)}"
         audit_action = "action_failed"
+        
+        # Insert into Dead Letter Queue (DLQ)
+        from models import DeadLetterQueue
+        db.add(DeadLetterQueue(
+            entity_type="RecoveryAction",
+            entity_id=recovery_action.id,
+            error_reason=str(e),
+        ))
 
     # Update timestamp
     recovery_action.executed_at = datetime.utcnow()

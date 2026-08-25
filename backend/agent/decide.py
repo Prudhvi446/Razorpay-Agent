@@ -209,11 +209,27 @@ def decide(diagnosis: Diagnosis, db: Session) -> RecoveryAction:
     else:
         scheduled_at = datetime.utcnow()
 
+    # SMART RETRY: Push soft declines to 10 AM if currently past 2 PM (optimal window)
+    if category == "soft_decline_retry":
+        tz = pytz.timezone(TIMEZONE)
+        now_tz = datetime.now(tz)
+        if now_tz.hour >= 14:
+            next_day = now_tz + timedelta(days=1)
+            optimal_time = next_day.replace(hour=10, minute=0, second=0, microsecond=0).replace(tzinfo=None)
+            if scheduled_at < optimal_time:
+                scheduled_at = optimal_time
+
     # GUARDRAIL 5: Quiet hours enforcement
     if is_quiet_hours():
         next_ok = next_allowed_time()
         if scheduled_at < next_ok.replace(tzinfo=None):
             scheduled_at = next_ok.replace(tzinfo=None)
+
+    # CART SAVER ENGINE: Apply 5% discount tag if abandoned cart > ₹2,000
+    discount_applied = False
+    pe = diagnosis.payment_event
+    if category == "customer_abandoned" and pe and pe.amount >= 200000:
+        discount_applied = True
 
     # ── Write audit log BEFORE creating the action ────────
     attempt_num = prior_count + 1
@@ -224,6 +240,8 @@ def decide(diagnosis: Diagnosis, db: Session) -> RecoveryAction:
         f"Scheduled for {scheduled_at.strftime('%Y-%m-%d %H:%M UTC')} "
         f"after {cooldown_hours}h cooldown."
     )
+    if discount_applied:
+        reason += " [CART SAVER: 5% Discount Applied]"
 
     db.add(AuditLog(
         actor="agent",
@@ -239,6 +257,7 @@ def decide(diagnosis: Diagnosis, db: Session) -> RecoveryAction:
         action_type=action_type,
         status="pending",
         scheduled_at=scheduled_at,
+        discount_applied=discount_applied,
     )
     db.add(action)
     db.flush()

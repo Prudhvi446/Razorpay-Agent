@@ -18,11 +18,19 @@ from config import FRONTEND_URL, BATCH_INTERVAL_MINUTES
 from database import engine, Base
 from routes.webhooks import router as webhook_router
 from routes.api import router as api_router
+import asyncio
 from agent.pipeline import run_batch
 
 # ── Scheduler ─────────────────────────────────────────────
 
 scheduler = BackgroundScheduler()
+
+def sync_run_batch():
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(run_batch())
+    except RuntimeError:
+        asyncio.run(run_batch())
 
 
 @asynccontextmanager
@@ -33,7 +41,7 @@ async def lifespan(app: FastAPI):
     print("✅ Database tables created/verified")
 
     scheduler.add_job(
-        run_batch,
+        sync_run_batch,
         "interval",
         minutes=BATCH_INTERVAL_MINUTES,
         id="recovery_agent_batch",
