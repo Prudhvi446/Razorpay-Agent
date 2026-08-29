@@ -21,8 +21,11 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
-from database import SessionLocal, engine, Base
-from models import PaymentEvent, AuditLog
+from database import SessionLocal, engine, Base, migrate_schema
+from models import (
+    PaymentEvent, AuditLog, CustomerProfile,
+    PromiseToPay, RecoveryAction, Diagnosis, TransactionStatus
+)
 
 import razorpay
 
@@ -111,15 +114,15 @@ def seed():
     print("Revenue Recovery Agent - Seed Failures Script")
     print("=" * 60)
 
-    # Ensure tables exist
-    Base.metadata.create_all(bind=engine)
+    # Ensure tables and columns exist
+    migrate_schema(engine)
     db = SessionLocal()
 
     scenarios = build_weighted_scenarios(40)
     ground_truth = {}
     created = 0
 
-    print(f"\nGenerating {len(scenarios)} failure scenarios...\n")
+    print(f"\nGenerating {len(scenarios)} failure and edge-case scenarios...\n")
 
     for i, (error_code, error_reason, error_desc, gt_category, _weight) in enumerate(scenarios):
         customer = random.choice(CUSTOMER_POOL)
@@ -129,9 +132,11 @@ def seed():
         # 50/50 A/B Testing split
         ab_group = "control_group" if (i % 2 == 0) else "ai_group"
 
-        # Plant a few dispute and fraud test cases to validate the Hard Kill Switch
+        # Edge-Case Plants
         is_disputed = (i == 3)
         is_fraud = (i == 7)
+        is_opted = (i == 11)
+        is_already_paid = (i == 15)
 
         # Create a real Razorpay order if keys exist, else realistic test order ID
         order = create_razorpay_order(amount)
@@ -139,26 +144,42 @@ def seed():
 
         # For abandoned carts, status is 'created' (no payment attempt)
         is_abandoned = (gt_category == "customer_abandoned" and error_code is None)
-        status = "created" if is_abandoned else "failed"
-        event_type = "order.created" if is_abandoned else "payment.failed"
+        status = "paid" if is_already_paid else ("created" if is_abandoned else "failed")
+        event_type = "payment.captured" if is_already_paid else ("order.created" if is_abandoned else "payment.failed")
 
         # Synthetic payment ID (Razorpay won't have one for abandoned orders)
-        rzp_pay_id = None if is_abandoned else f"pay_seed_{uuid.uuid4().hex[:14]}"
+        rzp_pay_id = f"pay_paid_{uuid.uuid4().hex[:12]}" if is_already_paid else (None if is_abandoned else f"pay_seed_{uuid.uuid4().hex[:14]}")
+        webhook_event_id = f"evt_seed_{uuid.uuid4().hex[:14]}"
+
+        cust_id = f"cust_opted_out_{customer['contact'][-4:]}" if is_opted else f"cust_{customer['contact'][-6:]}"
+
+        # Determine lifecycle status
+        if is_already_paid:
+            lifecycle = TransactionStatus.PAID
+        elif is_disputed or is_fraud:
+            lifecycle = TransactionStatus.DISPUTED
+        elif is_opted:
+            lifecycle = TransactionStatus.OPTED_OUT
+        else:
+            lifecycle = TransactionStatus.PENDING
 
         pe = PaymentEvent(
             id=str(uuid.uuid4()),
+            webhook_event_id=webhook_event_id,
             razorpay_payment_id=rzp_pay_id,
             order_id=order_id,
-            customer_id=f"cust_{customer['contact'][-6:]}",
+            customer_id=cust_id,
             customer_email=customer["email"],
             customer_contact=customer["contact"],
             amount=amount,
             currency="INR",
             status=status,
+            lifecycle_status=lifecycle,
+            opted_out=is_opted,
             method=method if not is_abandoned else None,
-            error_code=error_code,
-            error_description=error_desc,
-            error_reason=error_reason,
+            error_code=error_code if not is_already_paid else None,
+            error_description=error_desc if not is_already_paid else None,
+            error_reason=error_reason if not is_already_paid else None,
             event_type=event_type,
             disputed=is_disputed,
             fraud_suspected=is_fraud,
@@ -172,17 +193,91 @@ def seed():
                 "ab_group": ab_group,
                 "disputed": is_disputed,
                 "fraud_suspected": is_fraud,
+                "opted_out": is_opted,
+                "already_paid": is_already_paid,
             },
             created_at=datetime.utcnow() - timedelta(minutes=random.randint(5, 120)),
         )
         db.add(pe)
+
+        # Seed corresponding Edge Case Entities
+        if is_opted:
+            # Seed CustomerProfile with opted_out=True
+            db.add(CustomerProfile(
+                customer_id=cust_id,
+                customer_email=customer["email"],
+                customer_contact=customer["contact"],
+                opted_out=True,
+                opted_out_at=datetime.utcnow() - timedelta(hours=1),
+            ))
+
+        if i == 19:
+            # Seed Active Promise to Pay (3 days ahead)
+            db.add(PromiseToPay(
+                customer_id=cust_id,
+                payment_event_id=pe.id,
+                promised_amount=amount,
+                promised_date=datetime.utcnow() + timedelta(days=3),
+                status="pending",
+            ))
+
+        elif i == 23:
+            # Seed Expired Promise to Pay (expired 2 days ago)
+            db.add(PromiseToPay(
+                customer_id=cust_id,
+                payment_event_id=pe.id,
+                promised_amount=amount,
+                promised_date=datetime.utcnow() - timedelta(days=2),
+                status="pending",
+            ))
+
+        elif i == 27:
+            # Seed Invalid Promise Date
+            db.add(PromiseToPay(
+                customer_id=cust_id,
+                payment_event_id=pe.id,
+                promised_amount=amount,
+                promised_date=datetime.utcnow() - timedelta(days=5),
+                status="INVALID_PROMISE_DATE",
+            ))
+
+        elif i == 31:
+            # Seed Queued for Morning Window Action
+            diag = Diagnosis(
+                payment_event_id=pe.id,
+                root_cause_category=gt_category,
+                confidence=0.9,
+                llm_reasoning="Diagnosed for quiet hours testing.",
+            )
+            db.add(diag)
+            db.flush()
+            db.add(RecoveryAction(
+                diagnosis_id=diag.id,
+                action_type="send_email",
+                status="QUEUED_FOR_MORNING_WINDOW",
+                scheduled_at=datetime.utcnow() + timedelta(hours=8),
+                outcome="QUEUED_FOR_MORNING_WINDOW: Outreach scheduled for 08:30 AM IST.",
+            ))
+
         ground_truth[pe.id] = {
             "category": gt_category,
             "ab_group": ab_group,
         }
         created += 1
 
-        flag = "[DISPUTE]" if is_disputed else "[FRAUD]  " if is_fraud else ("[ABANDON]" if is_abandoned else "[FAILED] ")
+        if is_disputed:
+            flag = "[DISPUTE]"
+        elif is_fraud:
+            flag = "[FRAUD]  "
+        elif is_opted:
+            flag = "[OPT-OUT]"
+        elif is_already_paid:
+            flag = "[ALREADY]"
+        elif is_abandoned:
+            flag = "[ABANDON]"
+        else:
+            flag = "[FAILED] "
+
         grp_tag = "[CTRL]" if ab_group == "control_group" else "[AI]  "
         print(f"  {flag} {grp_tag} [{i+1:02d}] {gt_category:<25} Rs.{amount/100:>10,.2f}  {customer['name']:<16} {order_id}")
 
@@ -190,7 +285,7 @@ def seed():
     db.add(AuditLog(
         actor="system",
         action="seed_completed",
-        reasoning=f"Seeded {created} synthetic failure scenarios for testing.",
+        reasoning=f"Seeded {created} synthetic failure and edge-case scenarios for testing.",
         related_entity_type="PaymentEvent",
         related_entity_id=None,
     ))

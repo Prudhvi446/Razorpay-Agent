@@ -88,16 +88,58 @@ def get_last_action_time(diagnosis: Diagnosis, db: Session) -> datetime | None:
     return last.created_at if last else None
 
 
+def check_quiet_hours(timestamp: datetime | None = None, timezone: str = "Asia/Kolkata") -> bool:
+    """
+    Helper to check if dispatch time falls between 21:00 (9 PM) and 08:00 (8 AM)
+    in the specified timezone (default: Asia/Kolkata).
+    """
+    if timestamp is None:
+        timestamp = datetime.utcnow()
+    tz = pytz.timezone(timezone)
+    if timestamp.tzinfo is None:
+        dt_tz = pytz.utc.localize(timestamp).astimezone(tz)
+    else:
+        dt_tz = timestamp.astimezone(tz)
+    hour = dt_tz.hour
+    return hour >= 21 or hour < 8
+
+
+def get_morning_window(timestamp: datetime | None = None, timezone: str = "Asia/Kolkata") -> datetime:
+    """
+    Calculate the next morning window at 08:30 AM in the specified timezone,
+    returned as a naive UTC datetime.
+    """
+    if timestamp is None:
+        timestamp = datetime.utcnow()
+    tz = pytz.timezone(timezone)
+    if timestamp.tzinfo is None:
+        dt_tz = pytz.utc.localize(timestamp).astimezone(tz)
+    else:
+        dt_tz = timestamp.astimezone(tz)
+
+    if dt_tz.hour >= 21:
+        next_day = dt_tz + timedelta(days=1)
+        morning_dt = next_day.replace(hour=8, minute=30, second=0, microsecond=0)
+    elif dt_tz.hour < 8:
+        morning_dt = dt_tz.replace(hour=8, minute=30, second=0, microsecond=0)
+    else:
+        next_day = dt_tz + timedelta(days=1)
+        morning_dt = next_day.replace(hour=8, minute=30, second=0, microsecond=0)
+
+    return morning_dt.astimezone(pytz.utc).replace(tzinfo=None)
+
+
 def is_quiet_hours() -> bool:
     """Check if current time is within quiet hours (9PM–8AM in configured timezone)."""
-    tz = pytz.timezone(TIMEZONE)
-    now = datetime.now(tz)
-    hour = now.hour
-    if QUIET_HOURS_START > QUIET_HOURS_END:
-        # Wraps midnight: e.g. 21–8 means 21,22,23,0,1,...,7
-        return hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END
-    else:
-        return QUIET_HOURS_START <= hour < QUIET_HOURS_END
+    return check_quiet_hours(datetime.utcnow(), TIMEZONE)
+
+
+def check_opt_out_text(text: str | None) -> bool:
+    """Check if customer response text matches STOP, UNSUBSCRIBE, or DND."""
+    if not text:
+        return False
+    import re
+    return bool(re.search(r'\b(STOP|UNSUBSCRIBE|DND)\b', text, re.IGNORECASE))
 
 
 def is_hard_kill_switch_triggered(pe: PaymentEvent | None) -> bool:
@@ -197,6 +239,57 @@ def decide(diagnosis: Diagnosis, db: Session) -> RecoveryAction:
     pe = db.query(PaymentEvent).filter(PaymentEvent.id == diagnosis.payment_event_id).first()
     if not pe:
         pe = diagnosis.payment_event
+
+    # ── GUARDRAIL 00: Race Condition Check (Already PAID or SETTLED) ──
+    if pe and (
+        str(pe.status).upper() in ("PAID", "SETTLED", "CAPTURED")
+        or getattr(pe, "lifecycle_status", "").upper() in ("PAID", "SETTLED")
+    ):
+        reason = f"ALREADY_RESOLVED: Payment {pe.id[:8]} status is already {pe.status}. Halting recovery."
+        db.add(AuditLog(
+            actor="system",
+            action="ALREADY_RESOLVED",
+            reasoning=reason,
+            related_entity_type="PaymentEvent",
+            related_entity_id=pe.id,
+        ))
+        action = RecoveryAction(
+            diagnosis_id=diagnosis.id,
+            action_type="stop",
+            status="ALREADY_RESOLVED",
+            outcome="ALREADY_RESOLVED: Payment was already paid or settled",
+        )
+        db.add(action)
+        db.flush()
+        return action
+
+    # ── GUARDRAIL 00B: Customer Opt-Out / DND ───────────────────
+    from models import CustomerProfile
+    is_opted_out = getattr(pe, "opted_out", False)
+    if not is_opted_out and pe and pe.customer_id:
+        profile = db.query(CustomerProfile).filter(CustomerProfile.customer_id == pe.customer_id).first()
+        if profile and profile.opted_out:
+            is_opted_out = True
+            pe.opted_out = True
+
+    if is_opted_out:
+        reason = f"OPT_OUT_RECORDED: Customer {pe.customer_id or pe.id[:8]} has opted out (STOP/UNSUBSCRIBE/DND). Halting recovery."
+        db.add(AuditLog(
+            actor="customer",
+            action="OPT_OUT_RECORDED",
+            reasoning=reason,
+            related_entity_type="PaymentEvent",
+            related_entity_id=pe.id,
+        ))
+        action = RecoveryAction(
+            diagnosis_id=diagnosis.id,
+            action_type="stop",
+            status="stopped",
+            outcome="OPTED_OUT: Customer has opted out (STOP/UNSUBSCRIBE/DND)",
+        )
+        db.add(action)
+        db.flush()
+        return action
 
     # ── GUARDRAIL 0A: Hard Kill Switch (Disputed / Fraud Suspected) ──
     if pe and is_hard_kill_switch_triggered(pe):
@@ -351,10 +444,10 @@ def decide(diagnosis: Diagnosis, db: Session) -> RecoveryAction:
                 scheduled_at = optimal_time
 
     # GUARDRAIL 5: Quiet hours enforcement
-    if is_quiet_hours():
-        next_ok = next_allowed_time()
-        if scheduled_at < next_ok.replace(tzinfo=None):
-            scheduled_at = next_ok.replace(tzinfo=None)
+    action_status = "pending"
+    if check_quiet_hours(scheduled_at):
+        scheduled_at = get_morning_window(scheduled_at)
+        action_status = "QUEUED_FOR_MORNING_WINDOW"
 
     # CART SAVER ENGINE: Apply 5% discount tag if abandoned cart > ₹2,000
     discount_applied = False
@@ -371,6 +464,8 @@ def decide(diagnosis: Diagnosis, db: Session) -> RecoveryAction:
         f"Scheduled for {scheduled_at.strftime('%Y-%m-%d %H:%M UTC')} "
         f"after {cooldown_hours}h cooldown."
     )
+    if action_status == "QUEUED_FOR_MORNING_WINDOW":
+        reason += " [QUIET HOURS: QUEUED_FOR_MORNING_WINDOW at 08:30 AM]"
     if discount_applied:
         reason += " [CART SAVER: 5% Discount Applied]"
 
@@ -386,7 +481,7 @@ def decide(diagnosis: Diagnosis, db: Session) -> RecoveryAction:
     action = RecoveryAction(
         diagnosis_id=diagnosis.id,
         action_type=action_type,
-        status="pending",
+        status=action_status,
         scheduled_at=scheduled_at,
         discount_applied=discount_applied,
     )

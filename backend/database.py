@@ -56,6 +56,10 @@ def migrate_schema(bind_engine=None):
     target_engine = bind_engine or engine
     from sqlalchemy import inspect, text
     try:
+        # Import models so Base.metadata is fully populated with all tables
+        import models
+        Base.metadata.create_all(bind=target_engine)
+
         inspector = inspect(target_engine)
         if "payment_events" in inspector.get_table_names():
             columns = {col["name"] for col in inspector.get_columns("payment_events")}
@@ -76,6 +80,16 @@ def migrate_schema(bind_engine=None):
                     conn.execute(text("ALTER TABLE payment_events ADD COLUMN ab_group VARCHAR DEFAULT 'ai_group'"))
                 if "escalation_stage" not in columns:
                     conn.execute(text("ALTER TABLE payment_events ADD COLUMN escalation_stage INTEGER DEFAULT 1"))
+                if "webhook_event_id" not in columns:
+                    conn.execute(text("ALTER TABLE payment_events ADD COLUMN webhook_event_id VARCHAR"))
+                    try:
+                        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_payment_events_webhook_event_id ON payment_events (webhook_event_id)"))
+                    except Exception:
+                        pass
+                if "lifecycle_status" not in columns:
+                    conn.execute(text("ALTER TABLE payment_events ADD COLUMN lifecycle_status VARCHAR DEFAULT 'PENDING'"))
+                if "opted_out" not in columns:
+                    conn.execute(text(f"ALTER TABLE payment_events ADD COLUMN opted_out BOOLEAN DEFAULT {bool_default}"))
     except Exception as e:
         print(f"Notice: schema migration skipped or failed: {e}")
 

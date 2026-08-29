@@ -376,6 +376,70 @@ def send_email_via_resend(to_email: str, subject: str, html_body: str) -> dict:
         return {"status": "sent", "id": mock_id, "simulated": True, "notice": str(e)}
 
 
+def is_customer_opted_out(customer_id: str | None, db: Session) -> bool:
+    """Check if customer profile is marked as opted out."""
+    if not customer_id:
+        return False
+    from models import CustomerProfile
+    profile = db.query(CustomerProfile).filter(CustomerProfile.customer_id == customer_id).first()
+    return bool(profile and profile.opted_out)
+
+
+def record_customer_opt_out(customer_id: str, text: str, db: Session) -> bool:
+    """
+    If incoming customer text matches STOP, UNSUBSCRIBE, or DND:
+    - Sets opted_out = True on CustomerProfile and PaymentEvents
+    - Terminates all active recovery loops for that customer
+    - Logs OPT_OUT_RECORDED
+    """
+    import re
+    if not text or not re.search(r'\b(STOP|UNSUBSCRIBE|DND)\b', text, re.IGNORECASE):
+        return False
+
+    from models import CustomerProfile, PaymentEvent, RecoveryAction, AuditLog, Diagnosis, TransactionStatus
+
+    profile = db.query(CustomerProfile).filter(CustomerProfile.customer_id == customer_id).first()
+    if not profile:
+        profile = CustomerProfile(
+            customer_id=customer_id,
+            opted_out=True,
+            opted_out_at=datetime.utcnow(),
+        )
+        db.add(profile)
+    else:
+        profile.opted_out = True
+        profile.opted_out_at = datetime.utcnow()
+
+    # Update PaymentEvents for this customer
+    pe_list = db.query(PaymentEvent).filter(PaymentEvent.customer_id == customer_id).all()
+    pe_ids = [p.id for p in pe_list]
+    for p in pe_list:
+        p.opted_out = True
+        p.lifecycle_status = TransactionStatus.OPTED_OUT
+
+    # Terminate all active recovery loops for that customer
+    if pe_ids:
+        diag_ids = [r[0] for r in db.query(Diagnosis.id).filter(Diagnosis.payment_event_id.in_(pe_ids)).all()]
+        if diag_ids:
+            active_actions = db.query(RecoveryAction).filter(
+                RecoveryAction.diagnosis_id.in_(diag_ids),
+                RecoveryAction.status.in_(["pending", "scheduled", "QUEUED_FOR_MORNING_WINDOW"]),
+            ).all()
+            for act in active_actions:
+                act.status = "stopped"
+                act.outcome = "OPT_OUT_RECORDED: Customer requested STOP/UNSUBSCRIBE/DND"
+
+    db.add(AuditLog(
+        actor="customer",
+        action="OPT_OUT_RECORDED",
+        reasoning=f"Customer {customer_id} opted out with message '{text}'. Terminated all active recovery loops.",
+        related_entity_type="CustomerProfile",
+        related_entity_id=customer_id,
+    ))
+    db.flush()
+    return True
+
+
 def execute(recovery_action: RecoveryAction, db: Session):
     """
     Execute a recovery action by dispatching to the appropriate handler.
@@ -384,6 +448,38 @@ def execute(recovery_action: RecoveryAction, db: Session):
     pe = get_payment_event(recovery_action, db)
     diag = db.query(Diagnosis).filter(Diagnosis.id == recovery_action.diagnosis_id).first()
     category = diag.root_cause_category if diag else "unknown"
+
+    # ── Pre-execution Check 1: Quiet Hours Morning Window ──
+    if recovery_action.status == "QUEUED_FOR_MORNING_WINDOW":
+        if recovery_action.scheduled_at and recovery_action.scheduled_at > datetime.utcnow():
+            # Action is queued for morning window; do not execute real-time outreach yet
+            return
+
+    # ── Pre-execution Check 2: Customer Opt-Out ────────────
+    if pe and (getattr(pe, "opted_out", False) or is_customer_opted_out(pe.customer_id, db)):
+        recovery_action.status = "stopped"
+        recovery_action.outcome = "Aborted: Customer has opted out (DND/STOP)"
+        recovery_action.executed_at = datetime.utcnow()
+        db.flush()
+        return
+
+    # ── Pre-execution Check 3: Race Condition (Already Paid or Settled) ──
+    if pe and (
+        str(pe.status).upper() in ("PAID", "SETTLED", "CAPTURED")
+        or getattr(pe, "lifecycle_status", "").upper() in ("PAID", "SETTLED")
+    ):
+        recovery_action.status = "ALREADY_RESOLVED"
+        recovery_action.outcome = f"ALREADY_RESOLVED: Payment is already {pe.status}"
+        recovery_action.executed_at = datetime.utcnow()
+        db.add(AuditLog(
+            actor="system",
+            action="ALREADY_RESOLVED",
+            reasoning=f"Recovery action {recovery_action.id[:8]} aborted because payment status is {pe.status}.",
+            related_entity_type="RecoveryAction",
+            related_entity_id=recovery_action.id,
+        ))
+        db.flush()
+        return
 
     amount_display = f"₹{pe.amount / 100:,.2f}" if pe else "₹0"
     if pe and recovery_action.discount_applied:

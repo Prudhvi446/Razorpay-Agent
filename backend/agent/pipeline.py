@@ -23,7 +23,7 @@ from models import PaymentEvent, Diagnosis, RecoveryAction, AuditLog
 from agent.diagnose import diagnose
 from agent.decide import decide, is_hard_kill_switch_triggered, get_user_contact_count_24h
 from agent.execute import execute, generate_contextual_message
-from agent.promise_tracker import check_promises, get_active_promise_for_event
+from agent.promise_tracker import check_promises, check_expired_promises, get_active_promise_for_event
 from config import MAX_CONTACTS_PER_24H
 
 
@@ -58,6 +58,23 @@ async def node_diagnose(state: RecoveryGraphState) -> RecoveryGraphState:
         if not pe:
             state["error"] = f"PaymentEvent {pe_id} not found"
             state["stage"] = "failed"
+            return state
+
+        # Race condition check: If already paid or settled
+        if (
+            str(pe.status).upper() in ("PAID", "SETTLED", "CAPTURED")
+            or getattr(pe, "lifecycle_status", "").upper() in ("PAID", "SETTLED")
+        ):
+            state["stage"] = "completed"
+            state["action_status"] = "ALREADY_RESOLVED"
+            state["logs"].append(f"Payment {pe_id[:8]} is already PAID/SETTLED. Aborting recovery as ALREADY_RESOLVED.")
+            return state
+
+        # Customer Opt-Out Check
+        if getattr(pe, "opted_out", False):
+            state["stage"] = "stopped"
+            state["action_status"] = "OPTED_OUT"
+            state["logs"].append(f"Customer {pe.customer_id or pe_id[:8]} opted out. Recovery halted.")
             return state
 
         # Hard Kill Switch Check
@@ -225,8 +242,11 @@ async def node_execute(state: RecoveryGraphState) -> RecoveryGraphState:
             if state.get("discount_applied"):
                 action.discount_applied = True
 
-            # If action is ready and due, execute it immediately
-            if action.status == "pending" and action.scheduled_at and action.scheduled_at <= datetime.utcnow():
+            # If action is already resolved, stopped, or opted out, conclude pipeline
+            if action.status in ("ALREADY_RESOLVED", "OPTED_OUT", "stopped"):
+                state["action_status"] = action.status
+                state["stage"] = "stopped" if action.status in ("OPTED_OUT", "stopped") else "completed"
+            elif action.status == "pending" and action.scheduled_at and action.scheduled_at <= datetime.utcnow():
                 execute(action, db)
                 state["action_status"] = action.status
                 state["stage"] = "wait"
@@ -258,6 +278,9 @@ async def node_wait(state: RecoveryGraphState) -> RecoveryGraphState:
     pe_id = state["payment_event_id"]
     db = SessionLocal()
     try:
+        # Check and update any expired promises across the system
+        check_expired_promises(db)
+
         # Check if user promised to pay
         active_promise = get_active_promise_for_event(pe_id, db)
         if active_promise:
@@ -308,15 +331,18 @@ async def node_wait(state: RecoveryGraphState) -> RecoveryGraphState:
 # ── Conditional Routing ───────────────────────────────────
 
 def route_after_diagnose(state: RecoveryGraphState) -> str:
+    if state.get("stage") in ("failed", "completed", "stopped") or state.get("action_status") in ("ALREADY_RESOLVED", "OPTED_OUT"):
+        return END
     if state.get("is_kill_switch") or state.get("root_cause_category") == "unrecoverable":
         return "Execute"
-    if state.get("stage") == "failed":
-        return END
     return "Draft_Message"
 
 
 def route_after_execute(state: RecoveryGraphState) -> str:
-    if state.get("stage") in ("escalated", "stopped", "failed") or state.get("action_status") in ("failed", "Escalated_to_Human", "stop"):
+    if (
+        state.get("stage") in ("escalated", "stopped", "failed", "completed")
+        or state.get("action_status") in ("failed", "Escalated_to_Human", "stop", "ALREADY_RESOLVED", "OPTED_OUT")
+    ):
         return END
     return "Wait"
 

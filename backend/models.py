@@ -24,12 +24,26 @@ def _uuid():
     return str(uuid.uuid4())
 
 
+class TransactionStatus:
+    PENDING = "PENDING"
+    RECOVERY_IN_PROGRESS = "RECOVERY_IN_PROGRESS"
+    PAID = "PAID"
+    SETTLED = "SETTLED"
+    DISPUTED = "DISPUTED"
+    EXPIRED = "EXPIRED"
+    OPTED_OUT = "OPTED_OUT"
+    ESCALATED = "ESCALATED"
+    ALREADY_RESOLVED = "ALREADY_RESOLVED"
+    MALFORMED_PAYLOAD = "MALFORMED_PAYLOAD"
+
+
 # ── PaymentEvent ──────────────────────────────────────────
 
 class PaymentEvent(Base):
     __tablename__ = "payment_events"
 
     id                   = Column(String, primary_key=True, default=_uuid)
+    webhook_event_id     = Column(String, unique=True, index=True, nullable=True)
     razorpay_payment_id  = Column(String, index=True, nullable=True)
     order_id             = Column(String, index=True, nullable=True)
     customer_id          = Column(String, index=True, nullable=True)
@@ -38,6 +52,7 @@ class PaymentEvent(Base):
     amount               = Column(Integer, nullable=False)            # in paise
     currency             = Column(String, default="INR")
     status               = Column(String, nullable=False)             # failed, authorized, captured, created
+    lifecycle_status     = Column(String, default=TransactionStatus.PENDING, nullable=False)
     method               = Column(String, nullable=True)              # card, upi, netbanking, etc.
     error_code           = Column(String, nullable=True)
     error_description    = Column(String, nullable=True)
@@ -48,6 +63,7 @@ class PaymentEvent(Base):
     last_contacted_at    = Column(DateTime, nullable=True)
     disputed             = Column(Boolean, default=False, nullable=False)
     fraud_suspected      = Column(Boolean, default=False, nullable=False)
+    opted_out            = Column(Boolean, default=False, nullable=False)
     ab_group             = Column(String, default="ai_group", nullable=False) # control_group vs ai_group
     escalation_stage     = Column(Integer, default=1, nullable=False) # 1 (Day 1 soft reminder), 2 (Day 3 discount offer), 3 (Escalated)
     created_at           = Column(DateTime, default=datetime.utcnow)
@@ -57,7 +73,7 @@ class PaymentEvent(Base):
     promises             = relationship("PromiseToPay", back_populates="payment_event")
 
     def __repr__(self):
-        return f"<PaymentEvent {self.id[:8]} status={self.status} amount={self.amount} contacts={self.contact_count}>"
+        return f"<PaymentEvent {self.id[:8]} status={self.status} lifecycle={self.lifecycle_status} amount={self.amount} contacts={self.contact_count}>"
 
 
 # ── Diagnosis ─────────────────────────────────────────────
@@ -98,6 +114,8 @@ ACTION_TYPES = [
     "send_email",
     "escalate_human",
     "stop",
+    "ESCALATE_TO_ACCOUNT_MANAGER",
+    "FINAL_DUNNING_NOTICE",
 ]
 
 ACTION_STATUSES = [
@@ -108,6 +126,9 @@ ACTION_STATUSES = [
     "Escalated_to_Human",
     "stopped",
     "rate_limited",
+    "QUEUED_FOR_MORNING_WINDOW",
+    "ALREADY_RESOLVED",
+    "OPTED_OUT",
 ]
 
 class RecoveryAction(Base):
@@ -134,7 +155,13 @@ class RecoveryAction(Base):
 
 # ── PromiseToPay ──────────────────────────────────────────
 
-PROMISE_STATUSES = ["pending", "honored", "broken"]
+PROMISE_STATUSES = [
+    "pending",
+    "honored",
+    "broken",
+    "INVALID_PROMISE_DATE",
+    "PROMISE_BREACHED",
+]
 
 class PromiseToPay(Base):
     __tablename__ = "promises_to_pay"
@@ -191,3 +218,21 @@ class DeadLetterQueue(Base):
     entity_id            = Column(String, nullable=False)
     error_reason         = Column(Text, nullable=False)
     failed_at            = Column(DateTime, default=datetime.utcnow)
+
+
+# ── CustomerProfile (Opt-Out / Compliance) ─────────────────
+
+class CustomerProfile(Base):
+    __tablename__ = "customer_profiles"
+
+    id                   = Column(String, primary_key=True, default=_uuid)
+    customer_id          = Column(String, unique=True, index=True, nullable=False)
+    customer_email       = Column(String, nullable=True, index=True)
+    customer_contact     = Column(String, nullable=True, index=True)
+    opted_out            = Column(Boolean, default=False, nullable=False)
+    opted_out_at         = Column(DateTime, nullable=True)
+    created_at           = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<CustomerProfile {self.customer_id} opted_out={self.opted_out}>"
+

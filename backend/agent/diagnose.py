@@ -156,6 +156,22 @@ async def diagnose(payment_event: PaymentEvent, db: Session) -> Diagnosis:
     """
     from agent.decide import is_hard_kill_switch_triggered
 
+    # Pre-execution check: If already paid or settled, bypass LLM
+    if payment_event and (
+        str(payment_event.status).upper() in ("PAID", "SETTLED", "CAPTURED")
+        or getattr(payment_event, "lifecycle_status", "").upper() in ("PAID", "SETTLED")
+    ):
+        reasoning = f"Payment event {payment_event.id[:8]} status is already {payment_event.status}. Bypassing LLM diagnosis."
+        diag = Diagnosis(
+            payment_event_id=payment_event.id,
+            root_cause_category="unrecoverable",
+            confidence=1.0,
+            llm_reasoning=reasoning,
+        )
+        db.add(diag)
+        db.flush()
+        return diag
+
     # HARD KILL SWITCH: Disputed or suspected fraud bypasses all LLM calls immediately
     if is_hard_kill_switch_triggered(payment_event):
         reasoning = (
