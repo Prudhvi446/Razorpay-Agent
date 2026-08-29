@@ -457,15 +457,20 @@ def decide(diagnosis: Diagnosis, db: Session) -> RecoveryAction:
 
     # ── Write audit log BEFORE creating the action ────────
     attempt_num = prior_count + 1
+    scheduled_ist = (
+        pytz.utc.localize(scheduled_at).astimezone(pytz.timezone(TIMEZONE))
+        if scheduled_at.tzinfo is None
+        else scheduled_at.astimezone(pytz.timezone(TIMEZONE))
+    )
     reason = (
         f"Decided {action_type} for {category} "
         f"(attempt {attempt_num}/{config['max_attempts']}, "
         f"confidence {diagnosis.confidence:.2f}). "
-        f"Scheduled for {scheduled_at.strftime('%Y-%m-%d %H:%M UTC')} "
+        f"Scheduled for {scheduled_ist.strftime('%Y-%m-%d %I:%M %p IST')} "
         f"after {cooldown_hours}h cooldown."
     )
     if action_status == "QUEUED_FOR_MORNING_WINDOW":
-        reason += " [QUIET HOURS: QUEUED_FOR_MORNING_WINDOW at 08:30 AM]"
+        reason += " [QUIET HOURS: QUEUED_FOR_MORNING_WINDOW at 08:30 AM IST]"
     if discount_applied:
         reason += " [CART SAVER: 5% Discount Applied]"
 

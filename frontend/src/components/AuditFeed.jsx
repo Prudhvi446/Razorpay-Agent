@@ -13,10 +13,31 @@ const ACTION_COLORS = {
 
 const DEFAULT_COLOR = 'bg-slate-500/20 text-slate-400 border-slate-500/30';
 
+function formatIST(log) {
+  if (log.timestamp_display) {
+    return log.timestamp_display;
+  }
+  const raw = log.timestamp_ist || log.timestamp;
+  if (!raw) return '';
+  const hasTimezone = raw.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(raw);
+  const dateStr = hasTimezone ? raw : raw + 'Z';
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return raw;
+  return d.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    day: '2-digit',
+    month: 'short',
+  }) + ' IST';
+}
+
 function LogEntry({ log }) {
   const [expanded, setExpanded] = useState(false);
   const colorClass = ACTION_COLORS[log.action] || DEFAULT_COLOR;
-  const ts = new Date(log.timestamp).toLocaleString('en-IN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', day: '2-digit', month: 'short' });
+  const ts = formatIST(log);
 
   return (
     <div className="flex items-start gap-3 py-2 px-2 rounded hover:bg-slate-900/50 transition">

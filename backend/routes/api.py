@@ -33,6 +33,25 @@ from models import (
 from agent.pipeline import run_batch
 from agent.promise_tracker import record_promise
 import requests
+import pytz
+from typing import Optional
+
+IST_TIMEZONE = pytz.timezone("Asia/Kolkata")
+
+def to_ist_datetime(dt: Optional[datetime]) -> Optional[datetime]:
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        return pytz.utc.localize(dt).astimezone(IST_TIMEZONE)
+    return dt.astimezone(IST_TIMEZONE)
+
+def format_timestamp_ist(dt: Optional[datetime]) -> Optional[str]:
+    dt_ist = to_ist_datetime(dt)
+    return dt_ist.isoformat() if dt_ist else None
+
+def format_timestamp_display_ist(dt: Optional[datetime]) -> Optional[str]:
+    dt_ist = to_ist_datetime(dt)
+    return dt_ist.strftime("%d %b %Y, %I:%M:%S %p IST") if dt_ist else None
 
 API_KEY_NAME = "X-API-Key"
 API_KEY = os.getenv("DASHBOARD_API_KEY", "")
@@ -258,7 +277,9 @@ def get_audit_log(limit: int = Query(default=50, le=200), db: Session = Depends(
             "reasoning": e.reasoning,
             "related_entity_type": e.related_entity_type,
             "related_entity_id": e.related_entity_id,
-            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+            "timestamp": format_timestamp_ist(e.timestamp),
+            "timestamp_ist": format_timestamp_ist(e.timestamp),
+            "timestamp_display": format_timestamp_display_ist(e.timestamp),
         }
         for e in entries
     ]
