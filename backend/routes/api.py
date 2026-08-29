@@ -62,7 +62,7 @@ class PromiseRequest(BaseModel):
 
 @router.get("/stats")
 def get_stats(db: Session = Depends(get_db)):
-    """Dashboard summary stats."""
+    """Dashboard summary stats with comparative A/B metrics."""
     # Total at risk: sum of all failed payment amounts
     total_at_risk = (
         db.query(func.coalesce(func.sum(PaymentEvent.amount), 0))
@@ -70,9 +70,7 @@ def get_stats(db: Session = Depends(get_db)):
         .scalar()
     )
 
-    # Total recovered: sum of amounts with successful follow-up payments
-    # A payment is "recovered" if there's an executed recovery action
-    # and a subsequent successful payment for the same customer
+    # Total recovered
     recovered_events = (
         db.query(PaymentEvent.amount)
         .join(Diagnosis, Diagnosis.payment_event_id == PaymentEvent.id)
@@ -83,7 +81,7 @@ def get_stats(db: Session = Depends(get_db)):
     )
     total_recovered = sum(r[0] for r in recovered_events) if recovered_events else 0
 
-    # Also count honored promises as recovered
+    # Honored promises as recovered
     honored_promises = (
         db.query(func.coalesce(func.sum(PromiseToPay.promised_amount), 0))
         .filter(PromiseToPay.status == "honored")
@@ -99,11 +97,93 @@ def get_stats(db: Session = Depends(get_db)):
         .scalar()
     )
 
+    # ── A/B Group Metrics (Control vs AI) ─────────────────
+    control_at_risk = (
+        db.query(func.coalesce(func.sum(PaymentEvent.amount), 0))
+        .filter(PaymentEvent.status.in_(["failed", "created"]), PaymentEvent.ab_group == "control_group")
+        .scalar()
+    )
+    ai_at_risk = (
+        db.query(func.coalesce(func.sum(PaymentEvent.amount), 0))
+        .filter(PaymentEvent.status.in_(["failed", "created"]), PaymentEvent.ab_group == "ai_group")
+        .scalar()
+    )
+
+    control_recovered_events = (
+        db.query(PaymentEvent.amount)
+        .join(Diagnosis, Diagnosis.payment_event_id == PaymentEvent.id)
+        .join(RecoveryAction, RecoveryAction.diagnosis_id == Diagnosis.id)
+        .filter(
+            RecoveryAction.status == "executed",
+            RecoveryAction.action_type != "escalate_human",
+            PaymentEvent.ab_group == "control_group",
+        )
+        .all()
+    )
+    control_recovered = sum(r[0] for r in control_recovered_events) if control_recovered_events else 0
+
+    ai_recovered_events = (
+        db.query(PaymentEvent.amount)
+        .join(Diagnosis, Diagnosis.payment_event_id == PaymentEvent.id)
+        .join(RecoveryAction, RecoveryAction.diagnosis_id == Diagnosis.id)
+        .filter(
+            RecoveryAction.status == "executed",
+            RecoveryAction.action_type != "escalate_human",
+            PaymentEvent.ab_group == "ai_group",
+        )
+        .all()
+    )
+    ai_recovered = sum(r[0] for r in ai_recovered_events) if ai_recovered_events else 0
+
+    # Add honored promises to AI group
+    ai_honored_promises = (
+        db.query(func.coalesce(func.sum(PromiseToPay.promised_amount), 0))
+        .join(PaymentEvent, PaymentEvent.id == PromiseToPay.payment_event_id)
+        .filter(PromiseToPay.status == "honored", PaymentEvent.ab_group == "ai_group")
+        .scalar()
+    )
+    ai_recovered += (ai_honored_promises or 0)
+
+    control_rate = round((control_recovered / control_at_risk * 100), 1) if control_at_risk > 0 else 0
+    ai_rate = round((ai_recovered / ai_at_risk * 100), 1) if ai_at_risk > 0 else 0
+
+    if control_rate > 0:
+        incremental_lift_pct = round(((ai_rate - control_rate) / control_rate) * 100, 1)
+    elif ai_rate > 0:
+        incremental_lift_pct = round(ai_rate, 1)
+    else:
+        incremental_lift_pct = 0.0
+
+    incremental_revenue = max(0, ai_recovered - control_recovered)
+
+    control_count = db.query(func.count(PaymentEvent.id)).filter(PaymentEvent.ab_group == "control_group").scalar()
+    ai_count = db.query(func.count(PaymentEvent.id)).filter(PaymentEvent.ab_group == "ai_group").scalar()
+
+    ab_testing = {
+        "control_group": {
+            "name": "Control Group (Static Rules)",
+            "total_at_risk": control_at_risk,
+            "total_recovered": control_recovered,
+            "recovery_rate": control_rate,
+            "count": control_count,
+        },
+        "ai_group": {
+            "name": "AI Group (Agent Recovery)",
+            "total_at_risk": ai_at_risk,
+            "total_recovered": ai_recovered,
+            "recovery_rate": ai_rate,
+            "count": ai_count,
+        },
+        "incremental_lift_pct": incremental_lift_pct,
+        "incremental_revenue": incremental_revenue,
+    }
+
     return {
         "total_at_risk": total_at_risk,
         "total_recovered": total_recovered,
         "recovery_rate": recovery_rate,
         "active_recoveries": active_recoveries,
+        "ab_testing": ab_testing,
     }
 
 
@@ -230,17 +310,35 @@ def get_eval(db: Session = Depends(get_db)):
     diagnoses = db.query(Diagnosis).all()
     diag_map = {d.payment_event_id: d.root_cause_category for d in diagnoses}
 
-    # Calculate accuracy per category
+    # Calculate accuracy per category and per A/B group
     from collections import defaultdict
     category_stats = defaultdict(lambda: {"total": 0, "correct": 0})
+    ab_stats = {
+        "control_group": {"total": 0, "correct": 0},
+        "ai_group": {"total": 0, "correct": 0},
+    }
 
-    for pe_id, expected_cat in ground_truth.items():
+    for pe_id, val in ground_truth.items():
+        if isinstance(val, dict):
+            expected_cat = val.get("category")
+            ab_grp = val.get("ab_group", "ai_group")
+        else:
+            expected_cat = val
+            ab_grp = "ai_group"
+
         actual_cat = diag_map.get(pe_id)
         if actual_cat is None:
             continue  # Not yet diagnosed
+
         category_stats[expected_cat]["total"] += 1
-        if actual_cat == expected_cat:
+        is_correct = (actual_cat == expected_cat)
+        if is_correct:
             category_stats[expected_cat]["correct"] += 1
+
+        if ab_grp in ab_stats:
+            ab_stats[ab_grp]["total"] += 1
+            if is_correct:
+                ab_stats[ab_grp]["correct"] += 1
 
     categories = []
     overall_total = 0
@@ -258,11 +356,35 @@ def get_eval(db: Session = Depends(get_db)):
 
     overall_accuracy = (overall_correct / overall_total * 100) if overall_total > 0 else 0
 
+    ab_comparison = {
+        "control_group": {
+            "name": "Control Group (Static Rules)",
+            "total": ab_stats["control_group"]["total"],
+            "correct": ab_stats["control_group"]["correct"],
+            "accuracy": round(
+                (ab_stats["control_group"]["correct"] / ab_stats["control_group"]["total"] * 100)
+                if ab_stats["control_group"]["total"] > 0 else 0,
+                1
+            ),
+        },
+        "ai_group": {
+            "name": "AI Group (Agent Recovery)",
+            "total": ab_stats["ai_group"]["total"],
+            "correct": ab_stats["ai_group"]["correct"],
+            "accuracy": round(
+                (ab_stats["ai_group"]["correct"] / ab_stats["ai_group"]["total"] * 100)
+                if ab_stats["ai_group"]["total"] > 0 else 0,
+                1
+            ),
+        }
+    }
+
     return {
         "categories": categories,
         "overall_total": overall_total,
         "overall_correct": overall_correct,
         "overall_accuracy": round(overall_accuracy, 1),
+        "ab_comparison": ab_comparison,
     }
 
 

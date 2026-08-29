@@ -154,6 +154,32 @@ async def diagnose(payment_event: PaymentEvent, db: Session) -> Diagnosis:
     
     Returns a persisted Diagnosis object.
     """
+    from agent.decide import is_hard_kill_switch_triggered
+
+    # HARD KILL SWITCH: Disputed or suspected fraud bypasses all LLM calls immediately
+    if is_hard_kill_switch_triggered(payment_event):
+        reasoning = (
+            f"HARD KILL SWITCH ACTIVATED: Payment event {payment_event.id[:8]} flagged as "
+            f"{'disputed' if getattr(payment_event, 'disputed', False) else 'fraud_suspected'}. "
+            f"Bypassing all LLM calls and halting pipeline for human escalation."
+        )
+        diag = Diagnosis(
+            payment_event_id=payment_event.id,
+            root_cause_category="unrecoverable",
+            confidence=1.0,
+            llm_reasoning=reasoning,
+        )
+        db.add(diag)
+        db.add(AuditLog(
+            actor="system",
+            action="kill_switch_activated",
+            reasoning=reasoning,
+            related_entity_type="PaymentEvent",
+            related_entity_id=payment_event.id,
+        ))
+        db.flush()
+        return diag
+
     # Step 1: Deterministic pre-classification
     det_category = deterministic_classify(payment_event)
     retry_count = get_retry_count(payment_event, db)

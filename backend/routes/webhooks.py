@@ -43,10 +43,27 @@ def verify_signature(body: bytes, signature: str, secret: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+def check_dispute_or_fraud(payload: dict, entity: dict) -> tuple[bool, bool]:
+    """Parse incoming payload for disputed or fraud_suspected flags."""
+    notes = entity.get("notes", {}) if isinstance(entity, dict) else {}
+    disputed = bool(
+        payload.get("disputed") is True
+        or entity.get("disputed") is True
+        or notes.get("disputed") in (True, "true", "True", 1, "1")
+    )
+    fraud_suspected = bool(
+        payload.get("fraud_suspected") is True
+        or entity.get("fraud_suspected") is True
+        or notes.get("fraud_suspected") in (True, "true", "True", 1, "1")
+    )
+    return disputed, fraud_suspected
+
+
 def extract_payment_data(event_type: str, payload: dict) -> dict:
     """Extract payment/subscription data from the webhook payload."""
     if event_type.startswith("payment."):
         entity = payload.get("payment", {}).get("entity", {})
+        disputed, fraud_suspected = check_dispute_or_fraud(payload, entity)
         return {
             "razorpay_payment_id": entity.get("id"),
             "order_id": entity.get("order_id"),
@@ -60,9 +77,12 @@ def extract_payment_data(event_type: str, payload: dict) -> dict:
             "error_code": entity.get("error_code"),
             "error_description": entity.get("error_description"),
             "error_reason": entity.get("error_reason"),
+            "disputed": disputed,
+            "fraud_suspected": fraud_suspected,
         }
     elif event_type.startswith("subscription."):
         entity = payload.get("subscription", {}).get("entity", {})
+        disputed, fraud_suspected = check_dispute_or_fraud(payload, entity)
         return {
             "razorpay_payment_id": entity.get("payment_id"),
             "order_id": entity.get("id"),  # subscription ID as order reference
@@ -76,6 +96,8 @@ def extract_payment_data(event_type: str, payload: dict) -> dict:
             "error_code": entity.get("error_code"),
             "error_description": entity.get("error_description"),
             "error_reason": entity.get("error_reason"),
+            "disputed": disputed,
+            "fraud_suspected": fraud_suspected,
         }
     elif event_type == "order.paid":
         entity = payload.get("order", {}).get("entity", {})

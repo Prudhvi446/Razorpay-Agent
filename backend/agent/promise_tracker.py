@@ -57,6 +57,32 @@ def record_promise(
     return promise
 
 
+def get_active_promise_for_event(payment_event_id: str, db: Session) -> PromiseToPay | None:
+    """
+    Check if there is an active pending promise-to-pay for this payment event or customer.
+    Used by the LangGraph state machine to pause recovery workflow execution.
+    """
+    from sqlalchemy import or_
+    pe = db.query(PaymentEvent).filter(PaymentEvent.id == payment_event_id).first()
+    if not pe:
+        return None
+
+    filters = [PromiseToPay.payment_event_id == payment_event_id]
+    if pe.customer_id:
+        filters.append(PromiseToPay.customer_id == pe.customer_id)
+
+    return (
+        db.query(PromiseToPay)
+        .filter(
+            or_(*filters),
+            PromiseToPay.status == "pending",
+            PromiseToPay.promised_date >= datetime.utcnow(),
+        )
+        .order_by(PromiseToPay.promised_date.desc())
+        .first()
+    )
+
+
 def check_promises(db: Session) -> int:
     """
     Check all pending promises and update their status.

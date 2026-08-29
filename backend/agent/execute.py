@@ -11,10 +11,12 @@ Handlers:
 """
 
 import time
+import json
 from datetime import datetime
 
 import razorpay
 import requests
+import google.generativeai as genai
 from sqlalchemy.orm import Session
 
 from models import RecoveryAction, Diagnosis, PaymentEvent, AuditLog
@@ -23,7 +25,15 @@ from config import (
     RAZORPAY_KEY_SECRET,
     RESEND_API_KEY,
     RESEND_FROM_EMAIL,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
 )
+
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception:
+        pass
 
 rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
@@ -94,6 +104,165 @@ EMAIL_TEMPLATES = {
 </div>""",
     },
 }
+
+# ── Dynamic Contextual Prompting ─────────────────────────
+
+CONTEXTUAL_PROMPT = """You are an empathetic, compliant payment recovery AI for an Indian payment gateway (Razorpay).
+Craft a personalized recovery message tailored to the specific root cause.
+
+Transaction Details:
+- Root Cause Category: {category}
+- Specific Error: {error_reason} ({error_description})
+- Amount: ₹{amount_rupees}
+- Customer Name: {customer_name}
+- Recovery Stage: Day {day_step}
+- Discount Applied: {discount_applied}
+- Payment Link: {payment_link}
+
+Root Cause Specific Guidelines:
+- If Root Cause is "insufficient_funds" or "soft_decline_retry": Politely inform the customer of the transaction decline due to insufficient balance. Explicitly offer a split-payment link option so they can complete the payment in parts, or retry at their convenience.
+- If Root Cause is "network_bank_issue" or "gateway_timeout" or "Bank Gateway Downtime": Acknowledge the temporary bank gateway downtime, assure them their account has not been debited, and suggest completing payment using an alternative method such as instant UPI (Google Pay, PhonePe, Paytm) or NetBanking.
+- If Root Cause is "hard_decline_new_method": Politely explain the card issue (declined/expired) and offer options to use another credit/debit card or alternative payment rail.
+- If Root Cause is "auth_failure_3ds": Remind customer to enter the SMS/banking OTP before the session times out.
+- If Root Cause is "mandate_issue": Guide customer to re-authorize their e-mandate.
+- If Root Cause is "customer_abandoned": Day 1 gentle reminder. If discount_applied is True, emphasize the 5% Cart Saver discount.
+
+Compliance Constraints:
+- Polite, supportive, respectful, and strictly compliant tone.
+- Never use aggressive collection language or pressure tactics.
+- Respond ONLY with a valid JSON object matching this schema:
+{{
+  "subject": "Email subject string",
+  "message_body": "HTML body string including styles and the payment link placeholder {payment_link}",
+  "recovery_action_type": "send_email"
+}}
+"""
+
+
+def get_contextual_fallback(
+    category: str,
+    amount_display: str,
+    payment_link: str,
+    discount_applied: bool = False,
+    day_step: int = 1,
+) -> dict:
+    """Deterministic, compliant fallback templates strictly following root-cause contextual guidelines."""
+    if category == "soft_decline_retry":
+        return {
+            "subject": f"Flexible payment options: Complete your payment of {amount_display}",
+            "message_body": f"""<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b;">
+<h2 style="color: #0f172a;">Flexible Payment Options Available</h2>
+<p>Hi,</p>
+<p>Your recent transaction of <strong>{amount_display}</strong> could not be completed due to insufficient balance on your payment method.</p>
+<p>To help you complete your purchase conveniently, we've enabled our <strong>Split-Payment Option</strong> and flexible retry link:</p>
+<p><a href="{payment_link}" style="display: inline-block; padding: 12px 24px; background-color: #10b981; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">Split Payment / Retry Now</a></p>
+<p style="font-size: 13px; color: #64748b;">You can pay the full amount or opt for a split-payment schedule at your convenience. This link remains valid for 7 days.</p>
+</div>""",
+            "recovery_action_type": "send_email",
+        }
+    elif category == "network_bank_issue":
+        return {
+            "subject": f"Bank gateway issue resolved — retry payment of {amount_display} via UPI",
+            "message_body": f"""<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b;">
+<h2 style="color: #0f172a;">Bank Gateway Downtime Resolved</h2>
+<p>Hi,</p>
+<p>Your payment of <strong>{amount_display}</strong> could not be processed earlier due to temporary bank gateway downtime. No funds were debited from your account.</p>
+<p>We recommend using an alternative payment method such as <strong>instant UPI (GPay, PhonePe, Paytm)</strong> or NetBanking for a smooth checkout:</p>
+<p><a href="{payment_link}" style="display: inline-block; padding: 12px 24px; background-color: #10b981; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">Pay via UPI or Alternative Method</a></p>
+<p style="font-size: 13px; color: #64748b;">Instant UPI transactions are verified in real time without bank gateway delays.</p>
+</div>""",
+            "recovery_action_type": "send_email",
+        }
+    elif category == "hard_decline_new_method":
+        return {
+            "subject": f"Update payment method for your order of {amount_display}",
+            "message_body": f"""<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b;">
+<h2 style="color: #0f172a;">Payment Method Update Required</h2>
+<p>Hi,</p>
+<p>Your transaction of <strong>{amount_display}</strong> was declined by the card issuer. This usually occurs when a card has expired or reached limits.</p>
+<p>Please provide an alternative credit card, debit card, or UPI ID to complete your payment:</p>
+<p><a href="{payment_link}" style="display: inline-block; padding: 12px 24px; background-color: #10b981; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">Use Alternative Payment Method</a></p>
+</div>""",
+            "recovery_action_type": "send_email",
+        }
+    elif category == "customer_abandoned":
+        discount_text = "<p style='color: #059669; font-weight: bold;'>Special offer: A 5% Cart Saver discount has been applied to your order!</p>" if discount_applied else ""
+        return {
+            "subject": f"Complete your order of {amount_display}{' — 5% discount applied!' if discount_applied else ''}",
+            "message_body": f"""<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; color: #1e293b;">
+<h2 style="color: #0f172a;">Complete Your Order</h2>
+<p>Hi,</p>
+<p>It looks like your order of <strong>{amount_display}</strong> is waiting for you.</p>
+{discount_text}
+<p><a href="{payment_link}" style="display: inline-block; padding: 12px 24px; background-color: #10b981; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">Complete Payment Now</a></p>
+</div>""",
+            "recovery_action_type": "send_email",
+        }
+    else:
+        tmpl = EMAIL_TEMPLATES.get(category, EMAIL_TEMPLATES["soft_decline_retry"])
+        return {
+            "subject": tmpl["subject"].format(amount=amount_display),
+            "message_body": tmpl["body"].format(amount=amount_display, payment_link=payment_link),
+            "recovery_action_type": "send_email",
+        }
+
+
+def generate_contextual_message(
+    pe: PaymentEvent | None,
+    diagnosis: Diagnosis | None,
+    day_step: int = 1,
+    discount_applied: bool = False,
+    payment_link: str = "{payment_link}",
+) -> dict:
+    """
+    Generate dynamic contextual recovery message via Gemini LLM with structured JSON output.
+    Falls back reliably to category-specific contextual templates on error or offline mode.
+    """
+    category = diagnosis.root_cause_category if diagnosis else "soft_decline_retry"
+    amount_rupees = pe.amount / 100 if pe and pe.amount else 0
+    amount_display = f"₹{amount_rupees:,.2f}"
+    if discount_applied:
+        amount_display += " (incl. 5% discount)"
+
+    fallback = get_contextual_fallback(
+        category=category,
+        amount_display=amount_display,
+        payment_link=payment_link,
+        discount_applied=discount_applied,
+        day_step=day_step,
+    )
+
+    if not GEMINI_API_KEY:
+        return fallback
+
+    try:
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        prompt = CONTEXTUAL_PROMPT.format(
+            category=category,
+            error_reason=getattr(pe, "error_reason", "N/A") or "N/A",
+            error_description=getattr(pe, "error_description", "No error description") or "N/A",
+            amount_rupees=amount_rupees,
+            customer_name=getattr(pe, "customer_id", "Valued Customer") or "Valued Customer",
+            day_step=day_step,
+            discount_applied="Yes (5% Cart Saver applied)" if discount_applied else "None",
+            payment_link=payment_link,
+        )
+
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.2,
+            ),
+        )
+        data = json.loads(response.text)
+        if isinstance(data, dict) and "subject" in data and "message_body" in data:
+            if "recovery_action_type" not in data:
+                data["recovery_action_type"] = "send_email"
+            return data
+        return fallback
+    except Exception:
+        return fallback
 
 
 def get_payment_event(action: RecoveryAction, db: Session) -> PaymentEvent:
@@ -267,20 +436,28 @@ def execute(recovery_action: RecoveryAction, db: Session):
             payment_link_url = link_result.get("short_url", "https://rzp.io/placeholder")
             recovery_action.payment_link_url = payment_link_url
 
-            # ── A/B Testing: Template Selection ──────────
-            templates = ["standard", "urgent"]
-            selected_template = random.choice(templates)
-            recovery_action.template_used = selected_template
-
-            template_conf = EMAIL_TEMPLATES.get(category, EMAIL_TEMPLATES["soft_decline_retry"])
-            
-            subject = template_conf["subject"].format(amount=amount_display)
-            if selected_template == "urgent":
-                subject = f"Action Required: {subject}"
-
-            body = template_conf["body"].format(amount=amount_display, payment_link=payment_link_url)
-            if selected_template == "urgent":
-                body = body.replace("<h2", '<h2 style="color: #ef4444;"')
+            # ── A/B Testing & Contextual Message Generation ──────────
+            is_control_group = (getattr(pe, "ab_group", "ai_group") == "control_group")
+            if is_control_group:
+                # Control group: static standard template
+                recovery_action.template_used = "control_static"
+                template_conf = EMAIL_TEMPLATES.get(category, EMAIL_TEMPLATES["soft_decline_retry"])
+                subject = template_conf["subject"].format(amount=amount_display)
+                body = template_conf["body"].format(amount=amount_display, payment_link=payment_link_url)
+            else:
+                # AI group: Dynamic Contextual Generation tailored to root cause
+                recovery_action.template_used = "ai_dynamic_contextual"
+                msg_data = generate_contextual_message(
+                    pe=pe,
+                    diagnosis=diag,
+                    day_step=getattr(pe, "escalation_stage", 1),
+                    discount_applied=recovery_action.discount_applied,
+                    payment_link=payment_link_url,
+                )
+                subject = msg_data.get("subject", f"Payment update for {amount_display}")
+                body = msg_data.get("message_body", "")
+                if payment_link_url and "{payment_link}" in body:
+                    body = body.replace("{payment_link}", payment_link_url)
 
             email_result = send_email_via_resend(pe.customer_email, subject, body)
 
@@ -288,7 +465,7 @@ def execute(recovery_action: RecoveryAction, db: Session):
                 recovery_action.status = "executed"
                 recovery_action.outcome = (
                     f"Email sent to {pe.customer_email} (resend_id: {email_result['id']}, "
-                    f"template: {selected_template}). "
+                    f"mode: {'control_static' if is_control_group else 'ai_contextual'}). "
                     f"Payment link: {payment_link_url}"
                 )
                 audit_action = "email_sent"
@@ -321,6 +498,11 @@ def execute(recovery_action: RecoveryAction, db: Session):
             entity_id=recovery_action.id,
             error_reason=str(e),
         ))
+
+    # Update contact count and last contacted timestamp on PaymentEvent if contacted
+    if pe and recovery_action.status == "executed" and recovery_action.action_type in ("retry_payment_link", "retry_subscription", "send_email"):
+        pe.contact_count = (pe.contact_count or 0) + 1
+        pe.last_contacted_at = datetime.utcnow()
 
     # Update timestamp
     recovery_action.executed_at = datetime.utcnow()

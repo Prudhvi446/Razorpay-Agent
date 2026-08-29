@@ -44,6 +44,12 @@ class PaymentEvent(Base):
     error_reason         = Column(String, nullable=True)
     event_type           = Column(String, nullable=True)              # payment.failed, order.paid, etc.
     raw_payload          = Column(JSON, nullable=True)
+    contact_count        = Column(Integer, default=0, nullable=False)
+    last_contacted_at    = Column(DateTime, nullable=True)
+    disputed             = Column(Boolean, default=False, nullable=False)
+    fraud_suspected      = Column(Boolean, default=False, nullable=False)
+    ab_group             = Column(String, default="ai_group", nullable=False) # control_group vs ai_group
+    escalation_stage     = Column(Integer, default=1, nullable=False) # 1 (Day 1 soft reminder), 2 (Day 3 discount offer), 3 (Escalated)
     created_at           = Column(DateTime, default=datetime.utcnow)
 
     # Relationships
@@ -51,7 +57,7 @@ class PaymentEvent(Base):
     promises             = relationship("PromiseToPay", back_populates="payment_event")
 
     def __repr__(self):
-        return f"<PaymentEvent {self.id[:8]} status={self.status} amount={self.amount}>"
+        return f"<PaymentEvent {self.id[:8]} status={self.status} amount={self.amount} contacts={self.contact_count}>"
 
 
 # ── Diagnosis ─────────────────────────────────────────────
@@ -94,7 +100,15 @@ ACTION_TYPES = [
     "stop",
 ]
 
-ACTION_STATUSES = ["pending", "scheduled", "executed", "failed"]
+ACTION_STATUSES = [
+    "pending",
+    "scheduled",
+    "executed",
+    "failed",
+    "Escalated_to_Human",
+    "stopped",
+    "rate_limited",
+]
 
 class RecoveryAction(Base):
     __tablename__ = "recovery_actions"

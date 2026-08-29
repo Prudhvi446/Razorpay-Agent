@@ -126,6 +126,13 @@ def seed():
         amount = random.choice(AMOUNTS)
         method = random.choice(METHODS)
 
+        # 50/50 A/B Testing split
+        ab_group = "control_group" if (i % 2 == 0) else "ai_group"
+
+        # Plant a few dispute and fraud test cases to validate the Hard Kill Switch
+        is_disputed = (i == 3)
+        is_fraud = (i == 7)
+
         # Create a real Razorpay order if keys exist, else realistic test order ID
         order = create_razorpay_order(amount)
         order_id = order["id"] if order else f"order_seed_{uuid.uuid4().hex[:14]}"
@@ -153,20 +160,31 @@ def seed():
             error_description=error_desc,
             error_reason=error_reason,
             event_type=event_type,
+            disputed=is_disputed,
+            fraud_suspected=is_fraud,
+            ab_group=ab_group,
+            escalation_stage=1,
             raw_payload={
                 "source": "seed_failures",
                 "customer": customer,
                 "order_id": order_id,
                 "method": method,
+                "ab_group": ab_group,
+                "disputed": is_disputed,
+                "fraud_suspected": is_fraud,
             },
             created_at=datetime.utcnow() - timedelta(minutes=random.randint(5, 120)),
         )
         db.add(pe)
-        ground_truth[pe.id] = gt_category
+        ground_truth[pe.id] = {
+            "category": gt_category,
+            "ab_group": ab_group,
+        }
         created += 1
 
-        symbol = "[ABANDONED]" if is_abandoned else "[FAILED]   "
-        print(f"  {symbol} [{i+1:02d}] {gt_category:<25} Rs.{amount/100:>10,.2f}  {customer['name']:<16} {order_id}")
+        flag = "[DISPUTE]" if is_disputed else "[FRAUD]  " if is_fraud else ("[ABANDON]" if is_abandoned else "[FAILED] ")
+        grp_tag = "[CTRL]" if ab_group == "control_group" else "[AI]  "
+        print(f"  {flag} {grp_tag} [{i+1:02d}] {gt_category:<25} Rs.{amount/100:>10,.2f}  {customer['name']:<16} {order_id}")
 
     # Write audit log entry
     db.add(AuditLog(
@@ -189,7 +207,8 @@ def seed():
     print(f"[OK] Ground truth saved to {gt_path}")
     print(f"\nCategory Breakdown:")
     from collections import Counter
-    counts = Counter(ground_truth.values())
+    categories = [v["category"] if isinstance(v, dict) else v for v in ground_truth.values()]
+    counts = Counter(categories)
     for cat, cnt in sorted(counts.items(), key=lambda x: -x[1]):
         print(f"   {cat:<28} {cnt}")
     print()

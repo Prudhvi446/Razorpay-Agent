@@ -28,6 +28,7 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 # ── Agent Guardrails ──────────────────────────────────────
 MAX_CONTACTS_PER_INCIDENT = 3
+MAX_CONTACTS_PER_24H = 2
 QUIET_HOURS_START = 21        # 9 PM
 QUIET_HOURS_END = 8           # 8 AM
 TIMEZONE = "Asia/Kolkata"
