@@ -117,14 +117,17 @@ def get_stats(db: Session = Depends(get_db)):
     )
 
     # ── A/B Group Metrics (Control vs AI) ─────────────────
+    CONTROL_GROUPS = ["control", "control_group"]
+    AI_GROUPS = ["ai", "ai_group"]
+
     control_at_risk = (
         db.query(func.coalesce(func.sum(PaymentEvent.amount), 0))
-        .filter(PaymentEvent.status.in_(["failed", "created"]), PaymentEvent.ab_group == "control_group")
+        .filter(PaymentEvent.status.in_(["failed", "created"]), PaymentEvent.ab_group.in_(CONTROL_GROUPS))
         .scalar()
     )
     ai_at_risk = (
         db.query(func.coalesce(func.sum(PaymentEvent.amount), 0))
-        .filter(PaymentEvent.status.in_(["failed", "created"]), PaymentEvent.ab_group == "ai_group")
+        .filter(PaymentEvent.status.in_(["failed", "created"]), PaymentEvent.ab_group.in_(AI_GROUPS))
         .scalar()
     )
 
@@ -135,7 +138,7 @@ def get_stats(db: Session = Depends(get_db)):
         .filter(
             RecoveryAction.status == "executed",
             RecoveryAction.action_type != "escalate_human",
-            PaymentEvent.ab_group == "control_group",
+            PaymentEvent.ab_group.in_(CONTROL_GROUPS),
         )
         .all()
     )
@@ -148,7 +151,7 @@ def get_stats(db: Session = Depends(get_db)):
         .filter(
             RecoveryAction.status == "executed",
             RecoveryAction.action_type != "escalate_human",
-            PaymentEvent.ab_group == "ai_group",
+            PaymentEvent.ab_group.in_(AI_GROUPS),
         )
         .all()
     )
@@ -158,7 +161,7 @@ def get_stats(db: Session = Depends(get_db)):
     ai_honored_promises = (
         db.query(func.coalesce(func.sum(PromiseToPay.promised_amount), 0))
         .join(PaymentEvent, PaymentEvent.id == PromiseToPay.payment_event_id)
-        .filter(PromiseToPay.status == "honored", PaymentEvent.ab_group == "ai_group")
+        .filter(PromiseToPay.status == "honored", PaymentEvent.ab_group.in_(AI_GROUPS))
         .scalar()
     )
     ai_recovered += (ai_honored_promises or 0)
@@ -175,8 +178,8 @@ def get_stats(db: Session = Depends(get_db)):
 
     incremental_revenue = max(0, ai_recovered - control_recovered)
 
-    control_count = db.query(func.count(PaymentEvent.id)).filter(PaymentEvent.ab_group == "control_group").scalar()
-    ai_count = db.query(func.count(PaymentEvent.id)).filter(PaymentEvent.ab_group == "ai_group").scalar()
+    control_count = db.query(func.count(PaymentEvent.id)).filter(PaymentEvent.ab_group.in_(CONTROL_GROUPS)).scalar()
+    ai_count = db.query(func.count(PaymentEvent.id)).filter(PaymentEvent.ab_group.in_(AI_GROUPS)).scalar()
 
     ab_testing = {
         "control_group": {
@@ -342,7 +345,13 @@ def get_eval(db: Session = Depends(get_db)):
     for pe_id, val in ground_truth.items():
         if isinstance(val, dict):
             expected_cat = val.get("category")
-            ab_grp = val.get("ab_group", "ai_group")
+            raw_ab = val.get("ab_group", "ai_group")
+            if raw_ab in ("control", "control_group"):
+                ab_grp = "control_group"
+            elif raw_ab in ("ai", "ai_group"):
+                ab_grp = "ai_group"
+            else:
+                ab_grp = None
         else:
             expected_cat = val
             ab_grp = "ai_group"

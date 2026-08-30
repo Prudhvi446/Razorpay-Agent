@@ -5,10 +5,19 @@ const ACTION_COLORS = {
   decision_made: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
   action_executed: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
   escalation: 'bg-red-500/20 text-red-400 border-red-500/30',
+  Escalated_to_Human: 'bg-rose-500/20 text-rose-400 border-rose-500/30',
+  HALTED_FRAUD_DISPUTE: 'bg-red-500/20 text-red-400 border-red-500/30',
+  kill_switch_activated: 'bg-red-500/20 text-red-400 border-red-500/30',
+  Rate_Limit_Exceeded: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
+  OPT_OUT_RECORDED: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+  PROMISE_BREACHED: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
+  promise_recorded: 'bg-teal-500/20 text-teal-400 border-teal-500/30',
+  promise_honored: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
   webhook_received: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
   batch_run_completed: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
   payment_link_created: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
   email_sent: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  seed_completed: 'bg-indigo-500/20 text-indigo-400 border-indigo-500/30',
 };
 
 const DEFAULT_COLOR = 'bg-slate-500/20 text-slate-400 border-slate-500/30';

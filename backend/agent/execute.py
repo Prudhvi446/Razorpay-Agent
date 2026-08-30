@@ -533,7 +533,7 @@ def execute(recovery_action: RecoveryAction, db: Session):
             recovery_action.payment_link_url = payment_link_url
 
             # ── A/B Testing & Contextual Message Generation ──────────
-            is_control_group = (getattr(pe, "ab_group", "ai_group") == "control_group")
+            is_control_group = (getattr(pe, "ab_group", "ai_group") in ("control", "control_group"))
             if is_control_group:
                 # Control group: static standard template
                 recovery_action.template_used = "control_static"
