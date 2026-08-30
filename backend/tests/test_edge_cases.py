@@ -404,17 +404,13 @@ def test_quiet_hours_queuing(edge_db):
     edge_db.add(diag)
     edge_db.commit()
 
-    # Force quiet hours scheduled time by running decide
-    # We can test with a mocked late-night current time or check action status
-    action = RecoveryAction(
-        id="act_quiet_queued",
-        diagnosis_id=diag.id,
-        action_type="send_email",
-        status="QUEUED_FOR_MORNING_WINDOW",
-        scheduled_at=morning_window_utc,
-    )
-    edge_db.add(action)
-    edge_db.commit()
+    from unittest.mock import patch
+
+    # Force quiet hours scheduled time by running decide() with check_quiet_hours mocked to True
+    with patch("agent.decide.check_quiet_hours", return_value=True):
+        action = decide(diag, edge_db)
+        assert action.status == "QUEUED_FOR_MORNING_WINDOW"
+        assert action.scheduled_at > datetime.utcnow()
 
     # Verify execute() does NOT send real-time outreach while queued for morning window
     execute(action, edge_db)
